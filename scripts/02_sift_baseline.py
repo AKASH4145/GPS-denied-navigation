@@ -19,6 +19,7 @@ Assumptions (state these in the README too):
 Run from the project root (gps-denied-nav):
     python scripts\02_sift_baseline.py                 # v2 settings, every 5th frame of location 03
     python scripts\02_sift_baseline.py --step 1        # all 768 frames
+    python scripts\02_sift_baseline.py --offset 2      # held-out frames (3, 8, 13, ...) for final numbers
     python scripts\02_sift_baseline.py --sat-mpp 1 --model homography --hfov-deg 0 --nfeatures 5000 --tag v1
                                                        # reproduces the first run
 Outputs go to outputs\02_sift\<tag>\
@@ -93,6 +94,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--loc", default="03")
     ap.add_argument("--step", type=int, default=5, help="use every Nth frame (1 = all)")
+    ap.add_argument("--offset", type=int, default=0,
+                    help="start at this frame index; offset 0 was used for tuning, use 1-4 for held-out frames")
     ap.add_argument("--max-frames", type=int, default=0, help="stop after this many (0 = no limit)")
     ap.add_argument("--search-m", type=float, default=1500, help="side of the search window in metres")
     ap.add_argument("--prior-m", type=float, default=200, help="max offset of the window centre from GPS")
@@ -106,13 +109,15 @@ def main():
                     help="reject fits whose leftover rotation is bigger than this (only with --hfov-deg)")
     ap.add_argument("--nfeatures", type=int, default=8000)
     ap.add_argument("--ratio", type=float, default=0.75)
-    ap.add_argument("--min-inliers", type=int, default=15)
+    ap.add_argument("--min-inliers", type=int, default=4,
+                    help="a similarity fits 2 points exactly, so 4 means at least 2 extra points agree")
     ap.add_argument("--viz-every", type=int, default=10, help="save a match image every N frames")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default="", help="output subfolder name (default built from settings)")
     args = ap.parse_args()
 
-    tag = args.tag or f"mpp{args.sat_mpp:g}_{args.model}" + ("_scaled" if args.hfov_deg > 0 else "")
+    tag = args.tag or (f"mpp{args.sat_mpp:g}_{args.model}" + ("_scaled" if args.hfov_deg > 0 else "")
+                       + (f"_off{args.offset}" if args.offset else ""))
     out = ROOT / "outputs" / "02_sift" / tag
     (out / "viz").mkdir(parents=True, exist_ok=True)
 
@@ -122,7 +127,7 @@ def main():
     sift = cv2.SIFT_create(nfeatures=args.nfeatures)
     rng = np.random.default_rng(args.seed)
 
-    rows = load_drone_csv(args.loc)[::args.step]
+    rows = load_drone_csv(args.loc)[args.offset::args.step]
     if args.max_frames:
         rows = rows[:args.max_frames]
     print(f"[{tag}] Location {args.loc} ({region}): {len(rows)} frames | map {geo.W} x {geo.H} px "
