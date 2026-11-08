@@ -1,4 +1,4 @@
-"""
+r"""
 02_sift_baseline.py
 
 Baseline visual localisation: find each drone photo on the satellite map with SIFT + RANSAC,
@@ -6,14 +6,22 @@ read the lat/lon off the map, and compare it with the GPS label (ground truth).
 
 Assumptions (state these in the README too):
 - Heading is known (drone compass, Phi1 in the CSV), so each drone image is rotated north-up first.
+- Altitude is known (barometer, 'height' in the CSV) and the camera field of view is known, so the
+  drone image can be resized to the same metres-per-pixel as the satellite map before matching.
+  The field of view (--hfov-deg) was measured once from the first run's matched frames
+  (427 m wide footprint at 466 m altitude -> about 49 deg). In a real system it comes from the camera spec.
 - A rough position prior is known: the search window is centred on a point up to --prior-m metres
   from the true GPS position in a random direction, not on the GPS itself.
-- The camera points roughly straight down, so the image centre is taken as the drone's position.
+- The camera points roughly straight down over fairly flat ground, so the drone image and the map
+  are related by a similarity transform (shift, rotation, scale), and the image centre is taken
+  as the drone's position.
 
 Run from the project root (gps-denied-nav):
-    python scripts\02_sift_baseline.py                 # every 5th frame of location 03
+    python scripts\02_sift_baseline.py                 # v2 settings, every 5th frame of location 03
     python scripts\02_sift_baseline.py --step 1        # all 768 frames
-Outputs go to outputs\02_sift\
+    python scripts\02_sift_baseline.py --sat-mpp 1 --model homography --hfov-deg 0 --nfeatures 5000 --tag v1
+                                                       # reproduces the first run
+Outputs go to outputs\02_sift\<tag>\
 """
 
 import argparse
@@ -26,8 +34,6 @@ import numpy as np
 
 from geo_utils import ROOT, DATA, haversine_m, load_drone_csv, load_metric_map, rotate_keep_all
 
-OUT = ROOT / "outputs" / "02_sift"
-
 DRONE_FLAGS = {1: cv2.IMREAD_COLOR, 2: cv2.IMREAD_REDUCED_COLOR_2,
                4: cv2.IMREAD_REDUCED_COLOR_4, 8: cv2.IMREAD_REDUCED_COLOR_8}
 
@@ -37,7 +43,7 @@ def to_gray(img_bgr, clahe):
     return clahe.apply(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY))
 
 
-def match(drone_gray, drone_mask, sat_gray, sift, ratio):
+def match(drone_gray, drone_mask, sat_gray, sift, ratio, model):
     kp_d, des_d = sift.detectAndCompute(drone_gray, drone_mask)
     kp_s, des_s = sift.detectAndCompute(sat_gray, None)
     res = {"kp_d": kp_d, "kp_s": kp_s, "good": [], "inliers": [], "H": None}
@@ -53,7 +59,13 @@ def match(drone_gray, drone_mask, sat_gray, sift, ratio):
 
     src = np.float32([kp_d[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     dst = np.float32([kp_s[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+    if model == "similarity":
+        # 4 degrees of freedom: shift x/y, rotation, one scale. Needs fewer points than a homography
+        # and can't produce the skewed, stretched fits we saw in v1.
+        A, mask = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+        H = None if A is None else np.vstack([A, [0.0, 0.0, 1.0]])
+    else:
+        H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
     if H is not None:
         res["H"] = H
         res["inliers"] = [m for m, keep in zip(good, mask.ravel()) if keep]
@@ -84,18 +96,25 @@ def main():
     ap.add_argument("--max-frames", type=int, default=0, help="stop after this many (0 = no limit)")
     ap.add_argument("--search-m", type=float, default=1500, help="side of the search window in metres")
     ap.add_argument("--prior-m", type=float, default=200, help="max offset of the window centre from GPS")
-    ap.add_argument("--sat-mpp", type=float, default=1.0, help="satellite resolution used for matching")
+    ap.add_argument("--sat-mpp", type=float, default=0.5, help="metres per pixel used for matching")
     ap.add_argument("--drone-reduce", type=int, default=4, choices=[1, 2, 4, 8],
-                    help="load drone images at 1/N size")
-    ap.add_argument("--nfeatures", type=int, default=5000)
+                    help="load drone images at 1/N size (before resizing to --sat-mpp)")
+    ap.add_argument("--hfov-deg", type=float, default=49.2,
+                    help="camera horizontal field of view; 0 = don't resize the drone image")
+    ap.add_argument("--model", default="similarity", choices=["similarity", "homography"])
+    ap.add_argument("--max-rot", type=float, default=30,
+                    help="reject fits whose leftover rotation is bigger than this (only with --hfov-deg)")
+    ap.add_argument("--nfeatures", type=int, default=8000)
     ap.add_argument("--ratio", type=float, default=0.75)
     ap.add_argument("--min-inliers", type=int, default=15)
     ap.add_argument("--viz-every", type=int, default=10, help="save a match image every N frames")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--tag", default="", help="output subfolder name (default built from settings)")
     args = ap.parse_args()
 
-    OUT.mkdir(parents=True, exist_ok=True)
-    (OUT / "viz").mkdir(exist_ok=True)
+    tag = args.tag or f"mpp{args.sat_mpp:g}_{args.model}" + ("_scaled" if args.hfov_deg > 0 else "")
+    out = ROOT / "outputs" / "02_sift" / tag
+    (out / "viz").mkdir(parents=True, exist_ok=True)
 
     sat_bgr, geo, region = load_metric_map(args.loc, args.sat_mpp)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -106,7 +125,7 @@ def main():
     rows = load_drone_csv(args.loc)[::args.step]
     if args.max_frames:
         rows = rows[:args.max_frames]
-    print(f"Location {args.loc} ({region}): {len(rows)} frames | map {geo.W} x {geo.H} px "
+    print(f"[{tag}] Location {args.loc} ({region}): {len(rows)} frames | map {geo.W} x {geo.H} px "
           f"at {geo.mpp_x:.2f} x {geo.mpp_y:.2f} m/px | search {args.search_m:.0f} m, prior {args.prior_m:.0f} m")
 
     records = []
@@ -127,12 +146,20 @@ def main():
         if drone is None:
             print(f"  could not read {r['filename']}, skipping")
             continue
+
+        # Resize the drone image to the map's metres per pixel, using altitude and field of view
+        if args.hfov_deg > 0:
+            gsd = 2 * r["height"] * math.tan(math.radians(args.hfov_deg) / 2) / drone.shape[1]
+            f = gsd / geo.mpp_x
+            drone = cv2.resize(drone, None, fx=f, fy=f,
+                               interpolation=cv2.INTER_AREA if f < 1 else cv2.INTER_LINEAR)
+
         # North-up: rotate clockwise by Phi1 (cv2 angle = -Phi1). Checked by eye on frames 1 and 300.
         drone_up, M = rotate_keep_all(drone, -r["phi1"], return_matrix=True)
         mask = rotate_keep_all(np.full(drone.shape[:2], 255, np.uint8), -r["phi1"])
         mask = cv2.erode(mask, np.ones((15, 15), np.uint8))   # ignore keypoints on the black border
 
-        res = match(to_gray(drone_up, clahe), mask, sat_gray[y0:y1, x0:x1], sift, args.ratio)
+        res = match(to_gray(drone_up, clahe), mask, sat_gray[y0:y1, x0:x1], sift, args.ratio, args.model)
 
         rec = {"num": r["num"], "filename": r["filename"], "gt_lat": r["lat"], "gt_lon": r["lon"],
                "est_lat": "", "est_lon": "", "err_m": "", "n_good": len(res["good"]),
@@ -156,6 +183,9 @@ def main():
             est_xy = (u, v)
 
             ok = len(res["inliers"]) >= args.min_inliers and 0.1 < scale < 10
+            if args.hfov_deg > 0:
+                # Scale and heading are known, so a correct fit must have scale near 1 and little rotation
+                ok = ok and 0.75 < scale < 1.33 and abs(rot) < args.max_rot
             rec.update({"est_lat": round(est_lat, 7), "est_lon": round(est_lon, 7), "err_m": round(err, 1),
                         "scale": round(scale, 3), "rot_deg": round(rot, 1),
                         "footprint_m": round(w0 * scale * geo.mpp_x, 0),
@@ -168,11 +198,11 @@ def main():
 
         if i % args.viz_every == 0:
             gt_local = (gx - x0, gy - y0)
-            save_viz(OUT / "viz" / f"{args.loc}_{r['num']:04d}.jpg", drone_up, sat_bgr[y0:y1, x0:x1],
+            save_viz(out / "viz" / f"{args.loc}_{r['num']:04d}.jpg", drone_up, sat_bgr[y0:y1, x0:x1],
                      res, gt_local, est_xy, footprint)
 
     # ---------- results ----------
-    csv_path = OUT / f"results_{args.loc}.csv"
+    csv_path = out / f"results_{args.loc}.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(records[0].keys()))
         w.writeheader()
@@ -181,17 +211,20 @@ def main():
     n = len(records)
     ok = [r for r in records if r["status"] == "ok"]
     errs = np.array([r["err_m"] for r in ok], dtype=float)
-    print(f"\n===== SIFT baseline, location {args.loc}, {n} frames =====")
-    print(f"Matched (>= {args.min_inliers} inliers): {len(ok)}/{n} ({100 * len(ok) / n:.1f}%)")
+    all_errs = np.array([r["err_m"] for r in records if r["err_m"] != ""], dtype=float)
+    print(f"\n===== SIFT baseline [{tag}], location {args.loc}, {n} frames =====")
+    print(f"Accepted: {len(ok)}/{n} ({100 * len(ok) / n:.1f}%)")
     for t in (25, 50, 100):
-        print(f"Within {t:3d} m: {int((errs <= t).sum())}/{n} ({100 * (errs <= t).sum() / n:.1f}%)")
+        print(f"Accepted and within {t:3d} m: {int((errs <= t).sum())}/{n} ({100 * (errs <= t).sum() / n:.1f}%)")
+    print(f"Within 25 m before the accept check (shows how good the checks are): "
+          f"{int((all_errs <= 25).sum())}/{n}")
     if len(ok):
-        print(f"Median error of matched frames: {np.median(errs):.1f} m")
-        print(f"Matched but more than 100 m off (confident and wrong): {int((errs > 100).sum())}")
+        print(f"Median error of accepted frames: {np.median(errs):.1f} m")
+        print(f"Accepted but more than 100 m off (confident and wrong): {int((errs > 100).sum())}")
         print(f"Median inliers: {np.median([r['n_inliers'] for r in ok]):.0f} | "
               f"median leftover rotation: {np.median([abs(r['rot_deg']) for r in ok]):.1f} deg | "
               f"median footprint width: {np.median([r['footprint_m'] for r in ok]):.0f} m")
-    print(f"Saved {csv_path.relative_to(ROOT)} and match images in {(OUT / 'viz').relative_to(ROOT)}")
+    print(f"Saved {csv_path.relative_to(ROOT)} and match images in {(out / 'viz').relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
