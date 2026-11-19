@@ -17,7 +17,8 @@ from geo_utils import ROOT
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", default="mpp0.5_similarity_scaled", help="subfolder in outputs\\02_sift")
+    ap.add_argument("--stage", default="02_sift", help="folder in outputs, e.g. 02_sift or 03_lightglue")
+    ap.add_argument("--tag", default="mpp0.5_similarity_scaled", help="run subfolder inside the stage folder")
     ap.add_argument("--loc", default="03")
     ap.add_argument("--scale-lo", type=float, default=0.75)
     ap.add_argument("--scale-hi", type=float, default=1.33)
@@ -26,7 +27,7 @@ def main():
     ap.add_argument("--bad-m", type=float, default=100, help="error counted as wrong")
     args = ap.parse_args()
 
-    path = ROOT / "outputs" / "02_sift" / args.tag / f"results_{args.loc}.csv"
+    path = ROOT / "outputs" / args.stage / args.tag / f"results_{args.loc}.csv"
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
     n = len(rows)
