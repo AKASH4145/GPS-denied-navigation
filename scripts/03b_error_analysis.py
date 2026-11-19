@@ -19,13 +19,15 @@ Saves error_offsets.png next to the results CSV.
 
 import argparse
 import csv
+import math
+from datetime import datetime
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from geo_utils import ROOT, load_drone_csv
+from geo_utils import ROOT, haversine_m, load_drone_csv
 
 M_PER_DEG_LAT = 110574.0   # metres per degree of latitude (near 32 deg N)
 M_PER_DEG_LON_EQ = 111320.0  # metres per degree of longitude at the equator, scaled by cos(lat)
@@ -74,6 +76,22 @@ def main():
     fwd = d_e * np.sin(h) + d_n * np.cos(h)
     right = d_e * np.cos(h) - d_n * np.sin(h)
 
+    # Split frames by flight direction: same way as the first frame, or roughly opposite
+    same_dir = np.cos(h - h[0]) > 0
+
+    # Ground speed at each frame from the GPS log (neighbouring photos), to test lag vs tilt
+    all_rows = load_drone_csv(args.loc)
+    idx = {r["num"]: i for i, r in enumerate(all_rows)}
+
+    def gps_speed(n):
+        i = idx[n]
+        a, b = all_rows[max(i - 1, 0)], all_rows[min(i + 1, len(all_rows) - 1)]
+        dt = (datetime.fromisoformat(b["date"]) - datetime.fromisoformat(a["date"])).total_seconds()
+        return haversine_m(a["lat"], a["lon"], b["lat"], b["lon"]) / dt if dt > 0 else np.nan
+
+    speeds = np.array([gps_speed(n) for n in num])
+    height = np.mean([r["height"] for r in all_rows])
+
     raw = np.hypot(d_e, d_n)
     world_cv, world_fits = cv_corrected(d_e, d_n)
     body_cv, body_fits = cv_corrected(right, fwd)
@@ -90,6 +108,16 @@ def main():
     print(f"  fitted on each half: " + ", ".join(f"({f_:+.1f} fwd, {r_:+.1f} right)" for r_, f_ in body_fits))
     print("(the frame with the smaller spread is where the offset really is; the two halves should agree)\n")
 
+    print("Forward offset by flight direction (timing lag or camera tilt?):")
+    for sel in (same_dir, ~same_dir):
+        if not sel.any():
+            continue
+        heading = np.degrees(np.arctan2(np.sin(h[sel]).mean(), np.cos(h[sel]).mean())) % 360
+        f_mean, spd = fwd[sel].mean(), np.nanmedian(speeds[sel])
+        print(f"  heading ~{heading:3.0f} deg: forward {f_mean:+5.1f} m | ground speed {spd:4.1f} m/s | "
+              f"as a lag {f_mean / spd:4.2f} s | as a tilt {math.degrees(math.atan(f_mean / height)):4.2f} deg")
+    print("(similar lag in both directions -> timing lag; similar tilt, i.e. similar metres -> camera tilt)\n")
+
     print(f"{'correction':<30} | {'median error':>12} | {'within ' + str(int(args.good_m)) + ' m (of all frames)':>26}")
     print("-" * 76)
     for name, e in (("none", raw), ("world offset, cross-validated", world_cv),
@@ -98,8 +126,6 @@ def main():
         print(f"{name:<30} | {np.median(e):>10.1f} m | {within:>5}/{n_all} ({100 * within / n_all:.1f}%)")
 
     # ---------- plot ----------
-    # Split frames by flight direction: same way as the first frame, or roughly opposite
-    same_dir = np.cos(h - h[0]) > 0
     groups = [(same_dir, "tab:blue"), (~same_dir, "tab:orange")]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
