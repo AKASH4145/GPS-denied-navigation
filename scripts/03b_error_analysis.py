@@ -98,13 +98,21 @@ def main():
         print(f"{name:<30} | {np.median(e):>10.1f} m | {within:>5}/{n_all} ({100 * within / n_all:.1f}%)")
 
     # ---------- plot ----------
+    # Split frames by flight direction: same way as the first frame, or roughly opposite
+    same_dir = np.cos(h - h[0]) > 0
+    groups = [(same_dir, "tab:blue"), (~same_dir, "tab:orange")]
+
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     for ax, x, y, xl, yl, title in (
         (axes[0], d_e, d_n, "east error (m)", "north error (m)", "World frame"),
         (axes[1], right, fwd, "right error (m)", "forward error (m)", "Drone frame"),
     ):
-        sc = ax.scatter(x, y, c=np.degrees(h) % 360, cmap="hsv", s=18)
-        ax.plot(x.mean(), y.mean(), "r+", ms=16, mew=2, label=f"mean ({x.mean():+.1f}, {y.mean():+.1f})")
+        for sel, color in groups:
+            if sel.any():
+                heading = np.degrees(np.arctan2(np.sin(h[sel]).mean(), np.cos(h[sel]).mean())) % 360
+                ax.scatter(x[sel], y[sel], color=color, s=18, alpha=0.8,
+                           label=f"heading ~{heading:.0f} deg ({sel.sum()} frames)")
+        ax.plot(x.mean(), y.mean(), "k+", ms=16, mew=2, label=f"mean ({x.mean():+.1f}, {y.mean():+.1f})")
         ax.add_patch(plt.Circle((0, 0), args.good_m, fill=False, ls="--", color="gray"))
         ax.axhline(0, color="lightgray", lw=0.8)
         ax.axvline(0, color="lightgray", lw=0.8)
@@ -115,8 +123,7 @@ def main():
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
         ax.set_title(f"{title}, spread {spread(x, y):.1f} m")
-        ax.legend(loc="upper left")
-    fig.colorbar(sc, ax=axes, label="heading Phi1 (deg)", shrink=0.8)
+        ax.legend(loc="upper left", fontsize=8)
     png = folder / "error_offsets.png"
     fig.savefig(png, dpi=120, bbox_inches="tight")
     print(f"\nSaved {png.relative_to(ROOT)}")
