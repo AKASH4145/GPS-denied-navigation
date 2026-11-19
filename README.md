@@ -54,7 +54,9 @@ With LightGlue, almost every frame lands within 50 m but only 74% within 25 m, e
 
 ![Error offsets](assets/error_offsets.png)
 
-In the drone's frame (right), both flight directions land on the same spot, about 14 m forward. In the map's frame (left), each direction is offset the way it was flying, so the two cancel out on average. The estimate always lands about 14.3 m ahead of the GPS log. That fits either about 1 s of delay between the GPS log and the photo (the drone flies at about 13.6 m/s) or about 1.8 degrees of forward camera tilt. Both are constant on this flight, so the data cannot separate them.
+In the drone's frame (right), both flight directions land on the same spot, about 14 m forward. In the map's frame (left), each direction is offset the way it was flying, so the two cancel out on average. The estimate always lands about 14.3 m ahead of the GPS log.
+
+That could be a delay between the GPS log and the photo, or the camera being tilted forward. Wind helps tell them apart: the drone flew at 12.7 m/s going north-west and 23.8 m/s going south-east. A tilt would give the same offset in both directions, and a delay would give an offset proportional to speed. The actual offsets were 11.4 m and 17.3 m, so it is a mix. Fitting both gives roughly a 0.5 s camera-to-GPS time offset plus a fixed part of about 5 m, which would match about 0.6 degrees of forward camera pitch. With only two directions to fit, this split is an estimate rather than a measurement.
 
 Removing it, with the offset fitted on one half of the flight and tested on the other half:
 
@@ -66,7 +68,34 @@ Removing it, with the offset fitted on one half of the flight and tested on the 
 
 ### Tracking along the flight
 
-TODO: fill in after the full run.
+The tracker flies the whole flight using every 2nd photo (384 frames, 8 flight lines and 8 turns). It starts with a position up to 200 m off, and from then on it only uses its own visual fixes, the compass and the altimeter. Frames used to fit the 14.3 m correction are flown through but left out of the scores.
+
+| | Result |
+|---|---|
+| Frames with a visual fix | 306 / 307 (99.7%) |
+| Within 25 m | 92.2% |
+| Within 50 m | 99.3% |
+| Median error | 12.5 m |
+| Re-localisations needed | 0 |
+| Time per frame (CPU) | about 14 s |
+
+![Tracked path](assets/track_map.jpg)
+
+Green is the GPS log and red is the tracked path. The one miss was the first photo after the 4th turn, which coasted with a 263 m error and locked back on at the next photo with 3 m.
+
+![Error along the flight](assets/error_along_flight.png)
+
+**The first version failed, and why.** The first tracker predicted each position as "last position + speed x time gap, along the compass heading". It tracked the first two flight lines and then lost the drone for good at the second turn, ending up 29 km off. Looking at the GPS log showed two problems:
+
+- At each turn, the drone spends about 46 s turning and moves only about 240 m sideways to the next line. The tracker multiplied its speed by the whole 46 s and pushed the prediction 600 to 1,400 m along the new heading, outside the search window.
+- Because of wind, the drone flies at 13.5 m/s one way and 23.7 m/s the other, and points up to 13 degrees away from where it is actually going. The tracker carried the speed from one line into the next, so its prediction drifted by about 150 m per step.
+
+The second version fixes these using only information a drone has without GPS:
+
+- Velocity is learned as a 2D vector from the last two visual fixes, so it includes wind drift and the different speed in each direction. This also cut the typical prediction error from 35 m to 22 m.
+- A heading change of more than 60 degrees on the compass marks a turn. The old velocity is dropped and the search is centred on the last known position with a larger window.
+- The search window always stays inside the map.
+- After 3 missed frames in a row, the drone searches a 3 km area in tiles to find itself again. It was not needed on this flight, but it means one bad prediction is no longer fatal.
 
 ## Project structure
 
@@ -79,7 +108,8 @@ gps-denied-nav/
 │   ├── 02b_accept_sweep.py     re-scores results with different accept thresholds
 │   ├── 03_lightglue.py         single-frame localisation with SuperPoint + LightGlue
 │   ├── 03b_error_analysis.py   finds systematic offsets in the errors
-│   └── 04_track.py             tracking along the whole flight
+│   ├── 04_track.py             tracking along the whole flight
+│   └── 04b_turn_check.py       GPS log check around the turns
 ├── assets/                     images used in this README
 ├── data/                       dataset goes here (not in the repo)
 ├── outputs/                    results, created by the scripts (not in the repo)
@@ -115,14 +145,15 @@ python scripts/04_track.py
 ## Limitations
 
 - One location and one flight, all on the same day. The 14 m bias is fitted and tested within that flight.
-- About 19 s per frame on CPU (12 s while tracking) is far from real time. SuperPoint and LightGlue run in tens of milliseconds on a GPU or Jetson.
+- About 19 s per frame on CPU (14 s while tracking) is far from real time. SuperPoint and LightGlue run in tens of milliseconds on a GPU or Jetson.
+- The tracker was tuned while looking at this flight's turns. Its settings (turn threshold, window sizes) still need testing on other flights.
 - SuperPoint's weights are licensed for non-commercial use only. `--features disk` switches to DISK, which has a permissive license.
 - The satellite map is a mosaic of images taken on different dates, and tall buildings shift position in the drone photo depending on where they are in the frame. Both add error that a 2D transform cannot remove.
 
 ## Future plans
 
 - Run on all 11 locations of the full dataset, and check whether the same 14 m forward bias appears on other flights.
-- Estimate the actual direction of travel from recent fixes instead of the compass, to handle wind drift.
+- Replace the fixed 14.3 m correction with a fixed part plus a time offset multiplied by the tracker's own speed estimate.
 - Fuse visual fixes with IMU data in a Kalman filter instead of the simple predict-and-match loop.
 - Fine-tune LightGlue on drone-to-satellite pairs, and compare against LoFTR.
 - Test on VPAIR, which has more accurate ground truth.
